@@ -10,6 +10,11 @@ A private budgeting and bill-splitting app for two people. You add it to your iP
 - **USD and INR.** Enter expenses in either currency. Budgets and totals show in USD, using the daily rate or a fixed rate you set.
 - **Monthly limits.** Set shared limits per category, plus personal limits for each of you.
 - **Recurring expenses.** Rent and subscriptions are added automatically each month. You can edit any month's amount.
+- **Income & savings (Money tab).**
+  - **Paychecks:** each one has the full pay stub breakdown (gross, 401k, taxes, health insurance, other deductions, take-home, employer match). Regular paychecks are added automatically, monthly or every 2 weeks, and any single one can be edited.
+  - **Extra income:** added separately for each of you.
+  - **Savings:** log transfers to brokerage, savings and India investments. The 401k and employer match from paychecks count automatically.
+  - **Summary:** monthly cash flow (take-home − spending − savings = left over), savings rate, and net worth over time from the account balances you enter.
 
 ## What each service can see
 

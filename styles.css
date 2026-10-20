@@ -212,3 +212,38 @@ details summary { color: var(--accent); font-weight: 600; padding: 14px 0 4px; c
   transition: transform .25s; max-width: calc(100% - 32px); text-align: center; pointer-events: none;
 }
 #toast.show { transform: translate(-50%, 0); }
+
+/* ---------- money ---------- */
+.kv { display: flex; justify-content: space-between; gap: 12px; font-size: 15px; padding: 5px 0; }
+.kv span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.kv.total { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 9px; font-weight: 700; }
+.kv.total.neg span:last-child { color: var(--over); }
+.mini { margin-top: 8px; }
+.mini summary { font-size: 13px; color: var(--accent); padding: 4px 0; font-weight: 600; }
+.mini .kv { font-size: 13px; padding: 3px 0; }
+.row-pair { display: flex; }
+.row-pair .row { flex: 1; }
+.row-pair .row + .row { border-left: 1px solid var(--line); }
+.big-mid { font-size: 30px; font-weight: 700; letter-spacing: -.02em; margin: 4px 0 6px; }
+.small-t { font-size: 13px; }
+.cur { flex: 0 0 auto; padding: 0 6px; color: var(--muted); font-weight: 600; }
+.flow { display: flex; justify-content: space-between; gap: 8px; }
+.flow span { display: flex; flex-direction: column; }
+.flow small { color: var(--muted); }
+.flow b { font-size: 17px; }
+.row .x { flex: 0 0 auto; width: 30px; height: 30px; font-size: 13px; }
+
+.chart { position: relative; margin-top: 4px; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; touch-action: pan-y; }
+.chart .grid { stroke: var(--line); stroke-width: 1; }
+.chart .tick { fill: var(--muted); font-size: 11px; }
+.chart .line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .area { fill: var(--accent); opacity: .1; }
+.chart .dot { fill: var(--accent); stroke: var(--card); stroke-width: 2; }
+.chart .end-label { fill: var(--text); font-size: 12px; font-weight: 600; }
+.chart .cross { stroke: var(--muted); stroke-width: 1; }
+.chart .hit { fill: transparent; cursor: crosshair; }
+.chart .tip {
+  position: absolute; top: -6px; transform: translate(-50%, -100%); background: var(--text); color: var(--bg);
+  padding: 6px 10px; border-radius: 8px; font-size: 13px; text-align: center; pointer-events: none; white-space: nowrap;
+}
