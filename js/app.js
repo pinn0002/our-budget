@@ -2,7 +2,7 @@ import * as C from './crypto.js';
 import * as store from './store.js';
 import * as M from './model.js';
 import { clearRows, putRows } from './db.js';
-import { testConnection, pullRows } from './sync.js';
+import { testConnection, pullRows, normalizeUrl } from './sync.js';
 
 // ---------- config & helpers ----------
 
@@ -207,7 +207,7 @@ function renderCreate() {
   bindForm('f-create', async fd => {
     if (fd.pass !== fd.pass2) throw new Error("The passphrases don't match.");
     if (fd.pass.length < 10) throw new Error('Use at least 10 characters.');
-    const sync = fd.url && fd.key ? { url: fd.url.trim(), key: fd.key.trim() } : null;
+    const sync = fd.url && fd.key ? { url: normalizeUrl(fd.url), key: fd.key.trim() } : null;
     await createHousehold({ name: fd.name.trim(), pass: fd.pass, sync });
   }, 'Securing… this takes a few seconds');
 }
@@ -234,16 +234,37 @@ async function createHousehold({ name, pass, sync, demo = false }) {
   afterUnlock();
 }
 
+// Invite codes are hex only (0-9, a-f) so WhatsApp/iMessage can't turn _ * ~ into formatting.
+// The parser tolerates surrounding text, spaces, line breaks and quotes.
 function parseInvite(code) {
-  try {
-    const j = JSON.parse(atob(code.trim().replace(/^OB1:/, '').replace(/-/g, '+').replace(/_/g, '/')));
-    if (j.h && j.u && j.k) return j;
-  } catch {}
-  throw new Error("That invite code doesn't look right. Copy the whole code again.");
+  const v2 = String(code).match(/OB2\s*:([\s\S]*)/i);
+  if (v2) {
+    const hex = v2[1].replace(/[^0-9a-f]/gi, '');
+    // Anything typed after the code got glued on; trim from the end until it decodes.
+    for (let n = hex.length - (hex.length % 2); n >= Math.max(2, hex.length - 300); n -= 2) {
+      try {
+        const bytes = new Uint8Array(hex.slice(0, n).match(/../g).map(h => parseInt(h, 16)));
+        const j = JSON.parse(new TextDecoder().decode(bytes));
+        if (j.h && j.u && j.k) return j;
+      } catch {}
+    }
+    throw new Error("That invite code doesn't look right. On the first phone, use Settings → Invite partner → Share code, and paste the whole message here.");
+  }
+  // Older OB1 (base64) codes.
+  const s = String(code).replace(/^[\s\S]*?OB1\s*:/i, '').replace(/[\s"'“”‘’]/g, '');
+  const b0 = (s.match(/^[A-Za-z0-9+/_=-]+/)?.[0] || '').replace(/=/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  for (let n = b0.length; n >= Math.max(0, b0.length - 300); n--) {
+    try {
+      const b = b0.slice(0, n) + '='.repeat((4 - (n % 4)) % 4);
+      const j = JSON.parse(atob(b));
+      if (j.h && j.u && j.k) return j;
+    } catch {}
+  }
+  throw new Error("That invite code doesn't look right. On the first phone, use Settings → Invite partner → Share code, and paste the whole message here.");
 }
 
-const makeInvite = () => 'OB1:' + btoa(JSON.stringify({ h: cfg.household, u: cfg.sync.url, k: cfg.sync.key }))
-  .replace(/\+/g, '-').replace(/\//g, '_');
+const makeInvite = () => 'OB2:' + [...new TextEncoder().encode(JSON.stringify({ h: cfg.household, u: cfg.sync.url, k: cfg.sync.key }))]
+  .map(b => b.toString(16).padStart(2, '0')).join('');
 
 function renderJoin() {
   screen(`
@@ -983,7 +1004,8 @@ function inviteSheet() {
       <li>They tap <b>Join my partner's household</b> and paste this code:</li>
     </ol>
     <textarea readonly rows="4" class="code" id="invite-code">${esc(code)}</textarea>
-    <button class="primary" data-act="copy-invite">Copy code</button>
+    ${navigator.share ? '<button class="primary" data-act="share-invite">Share code…</button><button class="secondary" data-act="copy-invite">Copy code</button>'
+      : '<button class="primary" data-act="copy-invite">Copy code</button>'}
     <ol class="steps" start="3"><li>Tell them the <b>passphrase</b> in person or by phone, not in the same message as the code.</li></ol>
     <p class="hint">The code alone can't read anything. It only lets the app find your encrypted data.</p>`);
 }
@@ -1055,6 +1077,9 @@ const ACTIONS = {
   'edit-name': d => nameSheet(store.get(d.id)),
   'close-sheet': closeSheet,
   invite: inviteSheet,
+  'share-invite': async () => {
+    try { await navigator.share({ text: document.getElementById('invite-code').value }); } catch {}
+  },
   'copy-invite': async () => {
     const t = document.getElementById('invite-code');
     try { await navigator.clipboard.writeText(t.value); } catch { t.select(); document.execCommand('copy'); }
@@ -1099,9 +1124,9 @@ document.addEventListener('submit', async e => {
     const form = e.target;
     const fd = Object.fromEntries(new FormData(form));
     const err = form.querySelector('.err');
-    const sync = { url: fd.url.trim(), key: fd.key.trim() };
     try {
-      if (!sync.url || !sync.key) throw new Error('Enter both the URL and the key.');
+      if (!fd.url.trim() || !fd.key.trim()) throw new Error('Enter both the URL and the key.');
+      const sync = { url: normalizeUrl(fd.url), key: fd.key.trim() };
       await testConnection({ ...sync, household: cfg.household });
       cfg.sync = sync;
       cfg.demo = false;

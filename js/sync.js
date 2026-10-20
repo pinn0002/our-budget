@@ -8,8 +8,18 @@ function headers(cfg, extra = {}) {
   return h;
 }
 
+// Accepts "https://x.supabase.co", ".../rest/v1/", or the dashboard link ".../project/<ref>".
+export function normalizeUrl(input) {
+  const s = String(input || '').trim();
+  const dash = s.match(/supabase\.com\/dashboard\/project\/([a-z0-9]+)/i);
+  if (dash) return `https://${dash[1]}.supabase.co`;
+  let u;
+  try { u = new URL(/^https?:\/\//i.test(s) ? s : 'https://' + s); } catch { throw new Error("That Project URL doesn't look right. It should be like https://abcd.supabase.co"); }
+  return u.origin;
+}
+
 function base(cfg) {
-  return cfg.url.replace(/\/+$/, '') + '/rest/v1/records';
+  return normalizeUrl(cfg.url) + '/rest/v1/records';
 }
 
 async function check(res) {
