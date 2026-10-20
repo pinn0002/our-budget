@@ -150,6 +150,40 @@ async function seedDemo() {
     paidBy: a.id, forWhom: 'shared', split: null, day: 1, startMonth: prev, active: true,
   });
   await store.save({ id: newId('set'), type: 'settlement', date: day(month, 6), from: b.id, to: a.id, usd: 1200, note: 'Half of last month’s rent' });
+
+  // Money: accounts, balance history, paychecks, extra income, transfers.
+  const acct = (name, kind, owner, currency) => ({ id: newId('acct'), type: 'account', name, kind, owner, currency });
+  const k1 = acct('Fidelity 401k', '401k', a.id, 'USD');
+  const k2 = acct('Vanguard 401k', '401k', b.id, 'USD');
+  const brk = acct('Robinhood', 'brokerage', 'joint', 'USD');
+  const hysa = acct('Ally savings', 'savings', 'joint', 'USD');
+  const mf = acct('SBI mutual fund', 'india', a.id, 'INR');
+  await store.save([k1, k2, brk, hysa, mf]);
+  const bals = [];
+  for (let i = 9; i >= 0; i--) {
+    const m = M.addMonths(month, -i);
+    const d = i === 0 ? M.todayISO() : `${m}-${String(M.daysInMonth(m)).padStart(2, '0')}`;
+    const g = 9 - i;
+    const b0 = (acc, start, step, noise) => bals.push({ id: newId('bal'), type: 'balance', accountId: acc.id, date: d, amount: Math.round(start + step * g + noise * Math.sin(g * 1.7)), currency: acc.currency, rate });
+    b0(k1, 41000, 1350, 900); b0(k2, 28000, 980, 700); b0(brk, 12000, 520, 650); b0(hysa, 15000, 400, 0); b0(mf, 300000, 9000, 6000);
+  }
+  await store.save(bals);
+  const pay = (member, desc, freq, extra, gross, k401, match, taxes, health, other) => ({
+    id: newId('pay'), type: 'paySchedule', memberId: member.id, desc, freq, ...extra, currency: 'USD', active: true,
+    gross, k401, match, taxes, health, other, net: M.computedNet({ gross, k401, taxes, health, other }), accountId: (member === a ? k1 : k2).id,
+  });
+  const anchor = M.todayISO(new Date(Date.now() - 7 * 864e5 * 6));
+  await store.save([
+    pay(a, 'Paycheck – Acme', 'biweekly', { anchor }, 3200, 320, 160, 760, 95, 25),
+    pay(b, 'Paycheck – Globex', 'monthly', { day: 1, startMonth: prev }, 6500, 650, 325, 1550, 180, 0),
+  ]);
+  await store.save([
+    { id: newId('inc'), type: 'income', kind: 'extra', memberId: a.id, date: day(month, 9), net: 450, currency: 'USD', rate, source: 'Freelance / side gig', desc: 'Logo design' },
+    { id: newId('inc'), type: 'income', kind: 'extra', memberId: b.id, date: day(month, 3), net: 12000, currency: 'INR', rate, source: 'Rental income', desc: 'Pune flat rent' },
+    { id: newId('ctb'), type: 'contribution', accountId: brk.id, memberId: 'joint', date: day(month, 5), amount: 600, currency: 'USD', rate, note: 'Index funds' },
+    { id: newId('ctb'), type: 'contribution', accountId: hysa.id, memberId: b.id, date: day(month, 2), amount: 400, currency: 'USD', rate, note: '' },
+    { id: newId('ctb'), type: 'contribution', accountId: mf.id, memberId: a.id, date: day(month, 10), amount: 10000, currency: 'INR', rate, note: 'Monthly SIP' },
+  ]);
 }
 
 // ---------- boot / setup / unlock ----------
@@ -408,6 +442,7 @@ async function afterUnlock() {
   if (cfg.sync) { try { await store.sync(); } catch {} }
   await refreshRate();
   await runRecurring();
+  await runPaychecks();
   renderMain();
   syncTimer = setInterval(() => { if (!document.hidden) store.sync().catch(() => {}); }, 30000);
 }
@@ -442,14 +477,15 @@ const TABS = [
   ['home', '🏠', 'Home'],
   ['activity', '🧾', 'Activity'],
   ['budgets', '📊', 'Budgets'],
-  ['settle', '🤝', 'Settle up'],
+  ['money', '💰', 'Money'],
+  ['settle', '🤝', 'Settle'],
   ['settings', '⚙️', 'Settings'],
 ];
 
 function renderMain() {
   if (!rawBits || !me()) return;
   const scrollY = window.scrollY;
-  const showMonth = ['home', 'activity', 'budgets'].includes(ui.tab);
+  const showMonth = ['home', 'activity', 'budgets', 'money'].includes(ui.tab);
   const thisMonth = M.monthOf(M.todayISO());
   const ss = store.getSyncState();
   const syncDot = !cfg.sync ? '<span class="sync off" title="Not syncing">Local only</span>'
@@ -465,10 +501,12 @@ function renderMain() {
       ${syncDot}
     </header>
     <main id="view">${VIEWS[ui.tab]()}</main>
-    ${ui.tab !== 'settings' ? '<button class="fab" data-act="add-expense" aria-label="Add expense">＋</button>' : ''}
+    ${ui.tab === 'money' ? '<button class="fab" data-act="money-menu" aria-label="Add income or savings">＋</button>'
+      : ui.tab !== 'settings' ? '<button class="fab" data-act="add-expense" aria-label="Add expense">＋</button>' : ''}
     <nav class="tabs">${TABS.map(([id, icon, label]) =>
       `<button data-act="tab" data-tab="${id}" class="${ui.tab === id ? 'on' : ''}"><span>${icon}</span>${label}</button>`).join('')}</nav>`;
   if (ui.tab === 'activity') wireActivity();
+  if (ui.tab === 'money') wireChart();
   window.scrollTo(0, scrollY);
 }
 
@@ -542,6 +580,13 @@ const VIEWS = {
           <small class="muted">${money(s.person[id].personal)} personal + ${money(s.person[id].sharedPart)} share of shared</small>
         </div>`).join('')}
       </section>
+      ${(() => {
+        const t = monthCashFlow(ui.month).total;
+        return t.gross ? `<button class="card flow" data-act="tab" data-tab="money">
+          <span><small>Take-home</small><b>${money(t.net)}</b></span>
+          <span><small>Left over</small><b>${signed(t.leftOver)}</b></span>
+          <span><small>Saving</small><b>${pct(t.rate)}</b></span></button>` : '';
+      })()}
       ${alerts.length ? `<section><h3>Budget alerts</h3>${alerts.join('')}</section>` : ''}
       ${top.length ? `<section class="card"><h3>Top categories</h3>${top.map(([cid, v]) => `
         <div class="cat-line"><span>${esc(catOf(cid).emoji)} ${esc(catOf(cid).name)}</span><span>${money(v.total)}</span></div>
@@ -620,6 +665,13 @@ const VIEWS = {
         ${members().map(m => `<button class="row" data-act="edit-name" data-id="${m.id}"><span class="emoji">${m.id === cfg.meId ? '🙋' : '💑'}</span>
           <span class="row-main"><b>${esc(m.name)}</b><small>${m.id === cfg.meId ? 'You (this phone)' : m.claimed ? 'Partner' : 'Partner (not joined yet)'}</small></span><span class="chev">›</span></button>`).join('')}
       </div></section>
+
+      <section><h3>Regular paychecks</h3><div class="list card">
+        ${store.all('paySchedule').map(x => `<button class="row" data-act="edit-sched" data-id="${x.id}"><span class="emoji">💵</span>
+          <span class="row-main"><b>${esc(x.desc || 'Paycheck')}</b><small>${esc(nameOf(x.memberId))} · ${x.freq === 'biweekly' ? 'every 2 weeks' : `monthly on day ${x.day}`}${x.active ? '' : ' · paused'}</small></span>
+          <span class="row-amt">${moneyIn(x.net, x.currency)}<small>take-home</small></span></button>`).join('')}
+        <button class="row add" data-act="add-sched">＋ Add regular paycheck</button>
+      </div><p class="hint">These are added automatically on payday. If one paycheck was different (overtime, bonus), edit it on the Money tab.</p></section>
 
       <section><h3>Recurring expenses</h3><div class="list card">
         ${recs.map(x => `<button class="row" data-act="edit-rec" data-id="${x.id}"><span class="emoji">${esc(catOf(x.categoryId).emoji)}</span>
@@ -1152,6 +1204,492 @@ document.addEventListener('change', e => {
 });
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && $sheet.classList.contains('open')) closeSheet(); });
+
+// ---------- money: income, savings, net worth ----------
+
+const ACCOUNT_KINDS = {
+  '401k': ['🏦', '401k'],
+  brokerage: ['📈', 'Stocks / brokerage'],
+  savings: ['🐷', 'Savings'],
+  india: ['🇮🇳', 'India investments'],
+};
+const EXTRA_SOURCES = ['Bonus', 'Freelance / side gig', 'Rental income', 'Interest & dividends', 'Gift', 'Refund / reimbursement', 'Other'];
+const accounts = () => store.all('account').filter(a => !a.archived)
+  .sort((a, b) => Object.keys(ACCOUNT_KINDS).indexOf(a.kind) - Object.keys(ACCOUNT_KINDS).indexOf(b.kind) || a.name.localeCompare(b.name));
+const incomes = () => store.all('income');
+const ownerLabel = o => (o === 'joint' ? 'Joint' : nameOf(o));
+const pct = r => (r == null ? '—' : `${Math.round(r * 100)}%`);
+const signed = c => (c < 0 ? '−' + money(-c) : money(c));
+const compact = c => {
+  const d = Math.abs(c / 100);
+  const s = d >= 1e6 ? (d / 1e6).toFixed(d >= 1e7 ? 0 : 1) + 'M' : d >= 1e3 ? (d / 1e3).toFixed(d >= 1e4 ? 0 : 1) + 'K' : d.toFixed(0);
+  return (c < 0 ? '−$' : '$') + s.replace(/\.0(?=[KM])/, '');
+};
+
+// Each account's contributions in a month: manual transfers + 401k/match from linked paychecks.
+function accountContribs(month) {
+  const out = {};
+  for (const k of store.all('contribution')) if (M.monthOf(k.date) === month) out[k.accountId] = (out[k.accountId] || 0) + M.usdCents(k.amount, k.currency, k.rate);
+  for (const i of incomes()) if (i.kind === 'paycheck' && i.accountId && M.monthOf(i.date) === month) {
+    out[i.accountId] = (out[i.accountId] || 0) + M.usdCents((+i.k401 || 0) + (+i.match || 0), i.currency, i.rate);
+  }
+  return out;
+}
+
+function monthCashFlow(month) {
+  const ids = memberIds();
+  const sp = M.monthSummary(expenses(), month, ids);
+  return M.cashFlow(incomes(), store.all('contribution'), month, ids, Object.fromEntries(ids.map(id => [id, sp.person[id].total])));
+}
+
+const kv = (label, cents, cls = '') => `<div class="kv ${cls}"><span>${label}</span><span>${signed(cents)}</span></div>`;
+
+VIEWS.money = function () {
+  const ids = memberIds();
+  const cf = monthCashFlow(ui.month);
+  const t = cf.total;
+  const monthEnd = `${ui.month}-${String(M.daysInMonth(ui.month)).padStart(2, '0')}`;
+  const asOf = ui.month === M.monthOf(M.todayISO()) ? M.todayISO() : monthEnd;
+  const accts = accounts();
+  const bal = M.balancesAt(accts, store.all('balance'), asOf);
+  const worth = Object.values(bal).reduce((s, b) => s + b.cents, 0);
+  const contribs = accountContribs(ui.month);
+  const inc = incomes().filter(i => M.monthOf(i.date) === ui.month).sort((a, b) => b.date.localeCompare(a.date));
+  const transfers = store.all('contribution').filter(k => M.monthOf(k.date) === ui.month).sort((a, b) => b.date.localeCompare(a.date));
+  const noSchedules = !store.all('paySchedule').length;
+
+  return `
+    ${noSchedules ? `<div class="card banner"><span>Set up your regular paychecks once, and they'll be added automatically on every payday.</span>
+      <div><button class="small primary" data-act="add-sched">Set up a paycheck</button></div></div>` : ''}
+
+    <section class="card">
+      <div class="sec-head"><h3>Cash flow</h3></div>
+      ${kv('Take-home income', t.net)}
+      ${kv('Spending', -t.spending)}
+      ${kv('Moved to savings & investments', -t.transfers)}
+      ${kv('Left over', t.leftOver, 'total ' + (t.leftOver < 0 ? 'neg' : ''))}
+      <p class="hint">Also saved straight from paychecks: 401k ${money(t.k401)} + employer match ${money(t.match)}.</p>
+    </section>
+
+    <section class="card hero">
+      <small>Savings rate</small>
+      <div class="big">${pct(t.rate)}</div>
+      <small class="muted">${money(t.saved)} saved of ${money(t.gross + t.match)} (gross income + employer match)</small>
+      ${t.rate != null ? `<div class="bar"><i style="width:${Math.min(100, Math.max(0, t.rate * 100)).toFixed(1)}%"></i></div>` : ''}
+    </section>
+
+    <section class="people">${ids.map(id => {
+      const p = cf.person[id];
+      return `<div class="card person">
+        <small>${esc(nameOf(id))}</small>
+        <div class="mid">${signed(p.leftOver)}</div>
+        <small class="muted">left over · saving ${pct(p.rate)}</small>
+        <details class="mini"><summary>Details</summary>
+          ${kv('Gross pay', p.gross - p.extra)}${kv('Extra income', p.extra)}${kv('401k', -p.k401)}${kv('Taxes', -p.taxes)}
+          ${kv('Health & other', -p.deductions)}${kv('Take-home', p.net, 'total')}
+          ${kv('Spending', -p.spending)}${kv('To savings', -p.transfers)}${kv('Employer match', p.match)}
+        </details>
+      </div>`;
+    }).join('')}</section>
+
+    <section><h3>Income this month</h3><div class="list card">
+      ${inc.map(i => `<button class="row" data-act="edit-income" data-id="${i.id}">
+        <span class="emoji">${i.kind === 'paycheck' ? '💵' : '✨'}</span>
+        <span class="row-main"><b>${esc(i.desc || (i.kind === 'paycheck' ? 'Paycheck' : i.source || 'Extra income'))}${i.scheduleId ? ' <span class="badge">🔁</span>' : ''}</b>
+          <small>${esc(nameOf(i.memberId))} · ${dateLabel(i.date)}${i.kind === 'paycheck' ? ` · gross ${moneyIn(i.gross, i.currency)}` : ''}</small></span>
+        <span class="row-amt">${moneyIn(i.net, i.currency)}${i.kind === 'paycheck' ? '<small>take-home</small>' : ''}</span></button>`).join('')}
+      <div class="row-pair"><button class="row add" data-act="add-paycheck">＋ Paycheck</button><button class="row add" data-act="add-extra">＋ Extra income</button></div>
+    </div></section>
+
+    <section><h3>Moved to savings this month</h3><div class="list card">
+      ${transfers.map(k => {
+        const a = store.get(k.accountId);
+        return `<button class="row" data-act="edit-contrib" data-id="${k.id}"><span class="emoji">${ACCOUNT_KINDS[a?.kind]?.[0] || '💰'}</span>
+          <span class="row-main"><b>${esc(a?.name || 'Account')}</b><small>${esc(ownerLabel(k.memberId))} · ${dateLabel(k.date)}${k.note ? ' · ' + esc(k.note) : ''}</small></span>
+          <span class="row-amt">${moneyIn(k.amount, k.currency)}</span></button>`;
+      }).join('')}
+      <button class="row add" data-act="add-contrib">＋ Add to savings / investments</button>
+    </div><p class="hint">401k and employer match from paychecks are counted automatically, so don't add them here.</p></section>
+
+    <section class="card">
+      <div class="sec-head"><h3>Net worth</h3><span class="muted small-t">${ui.month === M.monthOf(M.todayISO()) ? 'today' : 'end of ' + monthLabel(ui.month)}</span></div>
+      <div class="big-mid">${money(worth)}</div>
+      ${netWorthChart(M.netWorthSeries(accts, store.all('balance'), ui.month, 12))}
+    </section>
+
+    <section><h3>Accounts</h3><div class="list card">
+      ${accts.map(a => {
+        const b = bal[a.id];
+        const c = contribs[a.id];
+        return `<button class="row" data-act="open-account" data-id="${a.id}"><span class="emoji">${ACCOUNT_KINDS[a.kind][0]}</span>
+          <span class="row-main"><b>${esc(a.name)}</b><small>${esc(ownerLabel(a.owner))} · ${b ? 'updated ' + dateLabel(b.date) : 'no balance yet'}${c ? ` · +${money(c)} this month` : ''}</small></span>
+          <span class="row-amt">${b ? moneyIn(b.amount, b.currency) : '—'}${b && b.currency === 'INR' ? `<small>${money(b.cents)}</small>` : ''}</span></button>`;
+      }).join('')}
+      <button class="row add" data-act="add-account">＋ Add account</button>
+    </div><p class="hint">Update balances whenever you check your accounts. Once a month is plenty. INR accounts count toward net worth in USD.</p></section>`;
+};
+
+// Single-series trend: 2px line + 10% area wash, end dot with surface ring, labeled end value,
+// hairline grid with compact ticks, tap/hover crosshair + tooltip.
+function netWorthChart(series) {
+  const first = series.findIndex(p => p.has);
+  const pts = first < 0 ? [] : series.slice(first);
+  if (pts.length < 2) return '<p class="hint">Add account balances in at least two different months to see the trend here.</p>';
+  const W = 340, H = 170, L = 44, R = 14, T = 22, B = 24;
+  const max = Math.max(...pts.map(p => p.cents), 1);
+  const step = Math.pow(10, Math.floor(Math.log10(max / 100))) * 100;
+  const top = Math.ceil(max / (step / 2)) * (step / 2) || 1;
+  const x = i => L + (i * (W - L - R)) / (pts.length - 1);
+  const y = c => T + (H - T - B) * (1 - c / top);
+  const line = pts.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.cents).toFixed(1)}`).join('');
+  const area = `${line}L${x(pts.length - 1).toFixed(1)},${y(0)}L${x(0).toFixed(1)},${y(0)}Z`;
+  const ticks = [0, top / 2, top];
+  const mon = m => new Date(m + '-15').toLocaleDateString(undefined, { month: 'short' });
+  const labelIdx = [...new Set([0, Math.floor((pts.length - 1) / 2), pts.length - 1])];
+  const last = pts[pts.length - 1];
+  const lx = x(pts.length - 1), ly = y(last.cents);
+  return `<div class="chart" id="nw-chart" data-pts='${esc(JSON.stringify(pts.map((p, i) => ({ m: monthLabel(p.month), v: money(p.cents), x: x(i), y: y(p.cents) }))))}'>
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Net worth by month, latest ${money(last.cents)}">
+      ${ticks.map(v => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="tick" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${compact(v)}</text>`).join('')}
+      ${labelIdx.map(i => `<text class="tick" x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? 'start' : i === pts.length - 1 ? 'end' : 'middle'}">${mon(pts[i].month)}</text>`).join('')}
+      <path class="area" d="${area}"/>
+      <path class="line" d="${line}"/>
+      <line class="cross" id="nw-cross" x1="0" x2="0" y1="${T}" y2="${H - B}" visibility="hidden"/>
+      <circle class="dot" id="nw-dot" r="4" cx="${lx}" cy="${ly}"/>
+      <text class="end-label" x="${lx}" y="${ly - 10}" text-anchor="end">${compact(last.cents)}</text>
+      <rect class="hit" x="${L}" y="0" width="${W - L - R}" height="${H}"/>
+    </svg>
+    <div class="tip" id="nw-tip" hidden></div>
+    <details class="mini"><summary>Show as table</summary>
+      ${pts.slice().reverse().map(p => `<div class="kv"><span>${monthLabel(p.month)}</span><span>${money(p.cents)}</span></div>`).join('')}
+    </details>
+  </div>`;
+}
+
+function wireChart() {
+  const box = document.getElementById('nw-chart');
+  if (!box) return;
+  const pts = JSON.parse(box.dataset.pts);
+  const svg = box.querySelector('svg');
+  const tip = box.querySelector('#nw-tip');
+  const cross = box.querySelector('#nw-cross');
+  const dot = box.querySelector('#nw-dot');
+  const reset = () => {
+    tip.hidden = true;
+    cross.setAttribute('visibility', 'hidden');
+    const p = pts[pts.length - 1];
+    dot.setAttribute('cx', p.x); dot.setAttribute('cy', p.y);
+  };
+  const show = e => {
+    const r = svg.getBoundingClientRect();
+    const vx = ((e.clientX - r.left) / r.width) * svg.viewBox.baseVal.width;
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(p.x - vx) < Math.abs(best.x - vx)) best = p;
+    cross.setAttribute('x1', best.x); cross.setAttribute('x2', best.x); cross.setAttribute('visibility', 'visible');
+    dot.setAttribute('cx', best.x); dot.setAttribute('cy', best.y);
+    tip.innerHTML = `<b>${esc(best.v)}</b><br><small>${esc(best.m)}</small>`;
+    tip.hidden = false;
+    const px = (best.x / svg.viewBox.baseVal.width) * r.width;
+    tip.style.left = Math.min(Math.max(px, 50), r.width - 50) + 'px';
+  };
+  svg.addEventListener('pointermove', show);
+  svg.addEventListener('pointerdown', show);
+  svg.addEventListener('pointerleave', reset);
+}
+
+async function runPaychecks() {
+  const due = M.duePaychecks(store.all('paySchedule'), store.exists);
+  if (!due.length) return;
+  const { rate } = currentRate();
+  await store.save(due.map(d => {
+    const s = store.get(d.scheduleId);
+    return {
+      id: d.id, type: 'income', kind: 'paycheck', memberId: s.memberId, date: d.date, desc: s.desc,
+      currency: s.currency, rate, gross: s.gross, k401: s.k401, match: s.match, taxes: s.taxes,
+      health: s.health, other: s.other, net: s.net, accountId: s.accountId || null, scheduleId: s.id,
+      _ts: new Date(d.date + 'T00:00:00').getTime(),
+    };
+  }));
+}
+
+const numIn = (name, label, val, hint = '') =>
+  `<label class="inline">${label}${hint ? ` <small class="muted">${hint}</small>` : ''}<input name="${name}" inputmode="decimal" placeholder="0.00" value="${val ?? ''}"></label>`;
+
+function accountOptions(selected, filter = () => true, none = '') {
+  return `${none ? `<option value="">${esc(none)}</option>` : ''}${accounts().filter(filter).map(a =>
+    `<option value="${a.id}" ${a.id === selected ? 'selected' : ''}>${ACCOUNT_KINDS[a.kind][0]} ${esc(a.name)} (${esc(ownerLabel(a.owner))})</option>`).join('')}`;
+}
+
+// Paycheck form, used for a single paycheck (income record) and for a regular schedule.
+function paycheckSheet(existing, { schedule = false } = {}) {
+  const ms = members();
+  const thisMonth = M.monthOf(M.todayISO());
+  const f = existing || { memberId: cfg.meId, currency: 'USD', date: ui.month === thisMonth ? M.todayISO() : `${ui.month}-01`, freq: 'monthly', day: 1, active: true, desc: 'Paycheck' };
+  const locked = schedule && existing; // dates of an existing schedule are fixed so paydays never duplicate
+  openSheet(`
+    ${sheetHead(schedule ? (existing ? 'Regular paycheck' : 'New regular paycheck') : existing ? 'Paycheck' : 'Add paycheck')}
+    <form id="f-pay">
+      <div class="field"><span class="lbl">Whose paycheck</span>${seg('memberId', ms.map(m => [m.id, m.name]), f.memberId)}</div>
+      <label>Name<input name="desc" value="${esc(f.desc || 'Paycheck')}" placeholder="e.g. Paycheck – Acme Inc."></label>
+      ${schedule ? (locked
+        ? `<p class="hint">${f.freq === 'biweekly' ? `Every 2 weeks, starting ${esc(f.anchor)}` : `Monthly on day ${f.day}`}. To change the schedule, delete this one and create a new one.</p>`
+        : `<div class="field"><span class="lbl">How often</span>${seg('freq', [['monthly', 'Monthly'], ['biweekly', 'Every 2 weeks']], f.freq)}</div>
+          <div id="freq-monthly">
+            <label class="inline">Paid on day <input name="day" type="number" min="1" max="31" value="${f.day}"> of the month</label>
+            <div class="field"><span class="lbl">Start</span>${seg('start', [[thisMonth, 'This month'], [M.addMonths(thisMonth, 1), 'Next month']], thisMonth)}</div>
+          </div>
+          <div id="freq-biweekly"><label>First payday to add<input type="date" name="anchor" value="${M.todayISO()}"></label>
+            <p class="hint">That payday and every 2 weeks after it get added. Pick your next payday to skip past ones.</p></div>`)
+        : `<label>Date<input type="date" name="date" value="${f.date}" required></label>`}
+      <div class="field"><span class="lbl">Currency</span>${seg('currency', [['USD', '$ USD'], ['INR', '₹ INR']], f.currency)}</div>
+      <h3>From the pay stub</h3>
+      ${numIn('gross', 'Gross pay', f.gross)}
+      ${numIn('k401', '401k (yours)', f.k401)}
+      ${numIn('taxes', 'Taxes', f.taxes, 'fed + state + FICA')}
+      ${numIn('health', 'Health insurance', f.health)}
+      ${numIn('other', 'Other deductions', f.other)}
+      ${numIn('net', 'Take-home', f.net)}
+      <p class="hint" id="net-hint"></p>
+      ${numIn('match', 'Employer 401k match', f.match)}
+      <label>Count 401k + match toward<select name="accountId">${accountOptions(f.accountId, a => a.kind === '401k', 'No account (still counted as saved)')}</select></label>
+      ${schedule && existing ? `<label class="check"><input type="checkbox" name="active" ${f.active ? 'checked' : ''}> Active (uncheck to pause)</label>
+        <p class="hint">Changes apply to future paydays. Paychecks already added stay as they are.</p>` : ''}
+      ${!schedule && f.scheduleId ? '<p class="hint">🔁 Added automatically. Edit it if this paycheck was different.</p>' : ''}
+      <p class="err" id="err"></p>
+      <button class="primary">${existing ? 'Save changes' : schedule ? 'Create' : 'Add paycheck'}</button>
+      ${existing ? `<button type="button" class="danger" data-act="del-pay">Delete ${schedule ? 'regular paycheck' : 'paycheck'}</button>` : ''}
+    </form>`);
+  const form = document.getElementById('f-pay');
+  const upd = () => {
+    if (form.freq && !locked) {
+      form.querySelector('#freq-monthly').hidden = form.freq.value !== 'monthly';
+      form.querySelector('#freq-biweekly').hidden = form.freq.value !== 'biweekly';
+    }
+    const fd = Object.fromEntries(new FormData(form));
+    const calc = M.computedNet(Object.fromEntries(['gross', 'k401', 'taxes', 'health', 'other'].map(k => [k, parseNum(fd[k])])));
+    form.net.placeholder = calc > 0 ? calc.toFixed(2) : '0.00';
+    const entered = parseNum(fd.net);
+    const diff = Math.round((entered - calc) * 100) / 100;
+    form.querySelector('#net-hint').textContent = !fd.net ? (calc > 0 ? `Leave blank to use ${moneyIn(calc, fd.currency)} (gross minus deductions).` : '')
+      : Math.abs(diff) >= 0.01 ? `Differs from gross minus deductions by ${moneyIn(Math.abs(diff), fd.currency)}. Double-check the numbers, or put the difference in "Other deductions".` : '✓ Matches the breakdown.';
+  };
+  form.addEventListener('input', upd);
+  form.addEventListener('change', upd);
+  upd();
+  form.querySelector('[data-act=del-pay]')?.addEventListener('click', async () => {
+    if (!confirm(schedule ? 'Stop this regular paycheck? Paychecks already added stay.' : 'Delete this paycheck?')) return;
+    await store.remove(existing);
+    closeSheet();
+  });
+  bindForm('f-pay', async fd => {
+    const n = k => Math.round(parseNum(fd[k]) * 100) / 100 || 0;
+    const fields = { gross: n('gross'), k401: n('k401'), match: n('match'), taxes: n('taxes'), health: n('health'), other: n('other') };
+    const net = fd.net ? n('net') : M.computedNet(fields);
+    if (!(fields.gross > 0) && !(net > 0)) throw new Error('Enter at least the gross pay or take-home.');
+    const common = { memberId: fd.memberId, desc: fd.desc.trim() || 'Paycheck', currency: fd.currency, ...fields, net, accountId: fd.accountId || null };
+    if (schedule) {
+      const s = existing ? { ...existing, ...common, active: fd.active === 'on' } : {
+        id: newId('pay'), type: 'paySchedule', active: true, freq: fd.freq, ...common,
+        ...(fd.freq === 'biweekly' ? { anchor: fd.anchor } : { day: Math.max(1, Math.min(31, Number(fd.day) || 1)), startMonth: fd.start }),
+      };
+      if (s.freq === 'biweekly' && !s.anchor) throw new Error('Pick the first payday.');
+      await store.save(s);
+      await runPaychecks();
+      toast('Regular paycheck saved');
+    } else {
+      const rate = existing && existing.currency === fd.currency ? existing.rate : currentRate().rate;
+      await store.save({ ...(existing || { id: newId('inc'), type: 'income', kind: 'paycheck' }), ...common, date: fd.date, rate });
+      toast(existing ? 'Saved' : 'Paycheck added');
+    }
+    closeSheet();
+  });
+}
+
+function extraIncomeSheet(existing) {
+  const ms = members();
+  const thisMonth = M.monthOf(M.todayISO());
+  const f = existing || { memberId: cfg.meId, currency: 'USD', date: ui.month === thisMonth ? M.todayISO() : `${ui.month}-01`, source: EXTRA_SOURCES[0], net: '' };
+  openSheet(`
+    ${sheetHead(existing ? 'Extra income' : 'Add extra income')}
+    <form id="f-extra">
+      <div class="field"><span class="lbl">Whose income</span>${seg('memberId', ms.map(m => [m.id, m.name]), f.memberId)}</div>
+      <div class="amount-row">
+        <input name="net" inputmode="decimal" placeholder="0.00" required value="${f.net}" aria-label="Amount">
+        ${seg('currency', [['USD', '$ USD'], ['INR', '₹ INR']], f.currency)}
+      </div>
+      <label>Type<select name="source">${EXTRA_SOURCES.map(s => `<option ${s === f.source ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></label>
+      <label>Note<input name="desc" value="${esc(f.desc || '')}" placeholder="e.g. Q3 bonus, Etsy sales"></label>
+      <label>Date<input type="date" name="date" value="${f.date}" required></label>
+      <p class="hint">Enter what you actually received (after any tax withheld).</p>
+      <p class="err" id="err"></p>
+      <button class="primary">${existing ? 'Save changes' : 'Add income'}</button>
+      ${existing ? '<button type="button" class="danger" data-act="del-extra">Delete</button>' : ''}
+    </form>`);
+  document.querySelector('[data-act=del-extra]')?.addEventListener('click', async () => {
+    if (!confirm('Delete this income?')) return;
+    await store.remove(existing);
+    closeSheet();
+  });
+  bindForm('f-extra', async fd => {
+    const amt = parseNum(fd.net);
+    if (!(amt > 0)) throw new Error('Enter an amount.');
+    const rate = existing && existing.currency === fd.currency ? existing.rate : currentRate().rate;
+    await store.save({
+      ...(existing || { id: newId('inc'), type: 'income', kind: 'extra' }),
+      memberId: fd.memberId, net: Math.round(amt * 100) / 100, currency: fd.currency, rate, source: fd.source, desc: fd.desc.trim(), date: fd.date,
+    });
+    closeSheet();
+    toast(existing ? 'Saved' : 'Income added');
+  });
+}
+
+function accountSheet(existing) {
+  const ms = members();
+  const f = existing || { name: '', kind: '401k', owner: cfg.meId, currency: 'USD' };
+  openSheet(`
+    ${sheetHead(existing ? 'Edit account' : 'New account')}
+    <form id="f-acct">
+      <label>Type<select name="kind">${Object.entries(ACCOUNT_KINDS).map(([k, [e, l]]) => `<option value="${k}" ${k === f.kind ? 'selected' : ''}>${e} ${l}</option>`).join('')}</select></label>
+      <label>Name<input name="name" required value="${esc(f.name)}" placeholder="e.g. Fidelity 401k, Robinhood, SBI FD"></label>
+      <div class="field"><span class="lbl">Belongs to</span>${seg('owner', [...ms.map(m => [m.id, m.name]), ['joint', 'Joint']], f.owner)}</div>
+      <div class="field"><span class="lbl">Currency</span>${seg('currency', [['USD', '$ USD'], ['INR', '₹ INR']], f.currency)}</div>
+      ${existing ? '' : `<label>Current balance (optional)<input name="balance" inputmode="decimal" placeholder="0.00"></label>`}
+      <p class="err" id="err"></p>
+      <button class="primary">${existing ? 'Save changes' : 'Add account'}</button>
+      ${existing ? '<button type="button" class="danger" data-act="del-acct">Hide account</button>' : ''}
+    </form>`);
+  const form = document.getElementById('f-acct');
+  if (!existing) form.kind.addEventListener('change', () => {
+    form.querySelector(`input[name=currency][value=${form.kind.value === 'india' ? 'INR' : 'USD'}]`).checked = true;
+  });
+  form.querySelector('[data-act=del-acct]')?.addEventListener('click', async () => {
+    if (!confirm('Hide this account? It stops counting toward net worth; its history is kept.')) return;
+    await store.save({ ...existing, archived: true });
+    closeSheet();
+  });
+  bindForm('f-acct', async fd => {
+    const a = { ...(existing || { id: newId('acct'), type: 'account' }), name: fd.name.trim(), kind: fd.kind, owner: fd.owner, currency: fd.currency };
+    const saves = [a];
+    const b = parseNum(fd.balance);
+    if (!existing && b > 0) saves.push({ id: newId('bal'), type: 'balance', accountId: a.id, date: M.todayISO(), amount: b, currency: a.currency, rate: currentRate().rate });
+    await store.save(saves);
+    closeSheet();
+    toast(existing ? 'Saved' : 'Account added');
+  });
+}
+
+function accountDetailSheet(a) {
+  const hist = store.all('balance').filter(b => b.accountId === a.id).sort((x, y) => y.date.localeCompare(x.date) || y.ts - x.ts);
+  openSheet(`
+    ${sheetHead(`${ACCOUNT_KINDS[a.kind][0]} ${esc(a.name)}`)}
+    <p class="muted">${esc(ACCOUNT_KINDS[a.kind][1])} · ${esc(ownerLabel(a.owner))} · ${a.currency}</p>
+    <form id="f-bal">
+      <h3>Update balance</h3>
+      <div class="amount-row"><input name="amount" inputmode="decimal" placeholder="Current value" required aria-label="Balance">
+        <span class="cur">${a.currency === 'INR' ? '₹ INR' : '$ USD'}</span></div>
+      <label>As of<input type="date" name="date" value="${M.todayISO()}" required></label>
+      <p class="err" id="err"></p>
+      <button class="primary">Save balance</button>
+    </form>
+    <button class="secondary" data-act="contrib-to" data-id="${a.id}">＋ Add a contribution</button>
+    <button class="ghost" data-act="edit-account" data-id="${a.id}">Edit account</button>
+    ${hist.length ? `<h3>Balance history</h3><div class="list card">${hist.slice(0, 24).map(b => `
+      <div class="row"><span class="row-main"><b>${moneyIn(b.amount, b.currency)}</b><small>${dateLabel(b.date)}</small></span>
+        <button class="x" data-act="del-bal" data-id="${b.id}" aria-label="Delete balance">✕</button></div>`).join('')}</div>` : ''}`);
+  bindForm('f-bal', async fd => {
+    const amt = parseNum(fd.amount);
+    if (!(amt >= 0) || fd.amount === '') throw new Error('Enter the balance.');
+    await store.save({ id: newId('bal'), type: 'balance', accountId: a.id, date: fd.date, amount: Math.round(amt * 100) / 100, currency: a.currency, rate: currentRate().rate });
+    closeSheet();
+    toast('Balance updated');
+  });
+}
+
+function contributionSheet(existing, accountId) {
+  const ms = members();
+  if (!accounts().length) {
+    toast('Add an account first');
+    return accountSheet();
+  }
+  const thisMonth = M.monthOf(M.todayISO());
+  const first = store.get(accountId) || accounts().find(a => a.kind !== '401k') || accounts()[0];
+  const f = existing || { accountId: first.id, memberId: first.owner, currency: first.currency, date: ui.month === thisMonth ? M.todayISO() : `${ui.month}-01`, amount: '', note: '' };
+  openSheet(`
+    ${sheetHead(existing ? 'Contribution' : 'Add to savings / investments')}
+    <form id="f-contrib">
+      <label>Account<select name="accountId">${accountOptions(f.accountId)}</select></label>
+      <div class="amount-row">
+        <input name="amount" inputmode="decimal" placeholder="0.00" required value="${f.amount}" aria-label="Amount">
+        ${seg('currency', [['USD', '$ USD'], ['INR', '₹ INR']], f.currency)}
+      </div>
+      <div class="field"><span class="lbl">From whose money</span>${seg('memberId', [...ms.map(m => [m.id, m.name]), ['joint', 'Both 50/50']], f.memberId)}</div>
+      <label>Date<input type="date" name="date" value="${f.date}" required></label>
+      <label>Note<input name="note" value="${esc(f.note || '')}" placeholder="e.g. monthly SIP, bought VTI"></label>
+      <p class="err" id="err"></p>
+      <button class="primary">${existing ? 'Save changes' : 'Add'}</button>
+      ${existing ? '<button type="button" class="danger" data-act="del-contrib">Delete</button>' : ''}
+    </form>`);
+  const form = document.getElementById('f-contrib');
+  if (!existing) form.accountId.addEventListener('change', () => {
+    const a = store.get(form.accountId.value);
+    form.querySelector(`input[name=currency][value=${a.currency}]`).checked = true;
+    form.querySelector(`input[name=memberId][value="${a.owner}"]`).checked = true;
+  });
+  form.querySelector('[data-act=del-contrib]')?.addEventListener('click', async () => {
+    if (!confirm('Delete this contribution?')) return;
+    await store.remove(existing);
+    closeSheet();
+  });
+  bindForm('f-contrib', async fd => {
+    const amt = parseNum(fd.amount);
+    if (!(amt > 0)) throw new Error('Enter an amount.');
+    const rate = existing && existing.currency === fd.currency ? existing.rate : currentRate().rate;
+    await store.save({
+      ...(existing || { id: newId('ctb'), type: 'contribution' }),
+      accountId: fd.accountId, memberId: fd.memberId, amount: Math.round(amt * 100) / 100, currency: fd.currency, rate, date: fd.date, note: fd.note.trim(),
+    });
+    closeSheet();
+    toast(existing ? 'Saved' : 'Added');
+  });
+}
+
+function moneyMenu() {
+  openSheet(`${sheetHead('Add')}
+    <div class="list card">
+      <button class="row" data-act="add-paycheck"><span class="emoji">💵</span><span class="row-main"><b>Paycheck</b><small>One paycheck, with the full breakdown</small></span></button>
+      <button class="row" data-act="add-extra"><span class="emoji">✨</span><span class="row-main"><b>Extra income</b><small>Bonus, side gig, dividends, gifts…</small></span></button>
+      <button class="row" data-act="add-contrib"><span class="emoji">📈</span><span class="row-main"><b>Add to savings / investments</b><small>Money moved to stocks, savings, India</small></span></button>
+      <button class="row" data-act="pick-balance"><span class="emoji">🔄</span><span class="row-main"><b>Update a balance</b><small>What an account is worth now</small></span></button>
+    </div>`);
+}
+
+function pickBalanceSheet() {
+  if (!accounts().length) return accountSheet();
+  openSheet(`${sheetHead('Which account?')}<div class="list card">${accounts().map(a =>
+    `<button class="row" data-act="open-account" data-id="${a.id}"><span class="emoji">${ACCOUNT_KINDS[a.kind][0]}</span><span class="row-main"><b>${esc(a.name)}</b><small>${esc(ownerLabel(a.owner))}</small></span><span class="chev">›</span></button>`).join('')}
+    <button class="row add" data-act="add-account">＋ Add account</button></div>`);
+}
+
+Object.assign(ACTIONS, {
+  'money-menu': moneyMenu,
+  'add-paycheck': () => paycheckSheet(),
+  'add-extra': () => extraIncomeSheet(),
+  'edit-income': d => { const i = store.get(d.id); i.kind === 'paycheck' ? paycheckSheet(i) : extraIncomeSheet(i); },
+  'add-sched': () => paycheckSheet(null, { schedule: true }),
+  'edit-sched': d => paycheckSheet(store.get(d.id), { schedule: true }),
+  'add-account': () => accountSheet(),
+  'edit-account': d => accountSheet(store.get(d.id)),
+  'open-account': d => accountDetailSheet(store.get(d.id)),
+  'pick-balance': pickBalanceSheet,
+  'add-contrib': () => contributionSheet(),
+  'contrib-to': d => contributionSheet(null, d.id),
+  'edit-contrib': d => contributionSheet(store.get(d.id)),
+  'del-bal': async (d, el) => {
+    if (!confirm('Delete this balance entry?')) return;
+    await store.remove(store.get(d.id));
+    el.closest('.row').remove();
+  },
+});
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 

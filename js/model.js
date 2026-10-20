@@ -157,3 +157,110 @@ export function parseReceipt(text) {
   }
   return { amount, currency, merchant: merchant.slice(0, 60), date };
 }
+
+// ---------- income, savings, net worth ----------
+
+// USD cents for an amount in USD or INR (rate = INR per USD).
+export const usdCents = (amount, currency, rate) => toCents(toUSD(Number(amount) || 0, currency, rate));
+
+const addDays = (iso, n) => {
+  const d = new Date(iso + 'T12:00:00');
+  d.setDate(d.getDate() + n);
+  return todayISO(d);
+};
+
+export const paycheckId = (scheduleId, date) => `inc_pay_${scheduleId}_${date.replace(/-/g, '')}`;
+
+// Paychecks that should exist for active schedules up to `today` but don't yet.
+// Monthly: on `day` of each month from startMonth. Biweekly: every 14 days from `anchor`.
+export function duePaychecks(schedules, exists, today = new Date()) {
+  const todayStr = todayISO(today);
+  const out = [];
+  for (const s of schedules) {
+    if (!s.active || s.deleted) continue;
+    const dates = [];
+    if (s.freq === 'biweekly') {
+      for (let d = s.anchor; d <= todayStr; d = addDays(d, 14)) dates.push(d);
+    } else {
+      for (let m = s.startMonth; m <= monthOf(todayStr); m = addMonths(m, 1)) {
+        const d = `${m}-${String(Math.min(s.day, daysInMonth(m))).padStart(2, '0')}`;
+        if (d <= todayStr) dates.push(d);
+      }
+    }
+    for (const date of dates) {
+      const id = paycheckId(s.id, date);
+      if (!exists(id)) out.push({ id, date, scheduleId: s.id });
+    }
+  }
+  return out;
+}
+
+// Paycheck take-home if not entered: gross minus every listed deduction.
+export const computedNet = p => Math.round(((+p.gross || 0) - (+p.k401 || 0) - (+p.taxes || 0) - (+p.health || 0) - (+p.other || 0)) * 100) / 100;
+
+// Monthly cash flow per person and combined, in cents.
+// incomes: paycheck {memberId, gross, k401, match, taxes, health, other, net} or extra {memberId, net}
+// contributions: {memberId | 'joint', amount, currency, rate}
+// spendingByPerson: { [memberId]: cents } (their personal + share of shared)
+export function cashFlow(incomes, contributions, month, memberIds, spendingByPerson) {
+  const blank = () => ({ gross: 0, net: 0, extra: 0, k401: 0, match: 0, taxes: 0, deductions: 0, transfers: 0, spending: 0 });
+  const p = Object.fromEntries(memberIds.map(id => [id, blank()]));
+  for (const i of incomes) {
+    if (monthOf(i.date) !== month || !p[i.memberId]) continue;
+    const t = p[i.memberId];
+    const c = x => usdCents(x, i.currency, i.rate);
+    if (i.kind === 'paycheck') {
+      t.gross += c(i.gross);
+      t.net += c(i.net);
+      t.k401 += c(i.k401);
+      t.match += c(i.match);
+      t.taxes += c(i.taxes);
+      t.deductions += c(i.health) + c(i.other);
+    } else {
+      t.extra += c(i.net);
+      t.gross += c(i.net);
+      t.net += c(i.net);
+    }
+  }
+  for (const k of contributions) {
+    if (monthOf(k.date) !== month) continue;
+    const cents = usdCents(k.amount, k.currency, k.rate);
+    if (k.memberId === 'joint') {
+      const half = Math.round(cents / memberIds.length);
+      memberIds.forEach((id, n) => { p[id].transfers += n === memberIds.length - 1 ? cents - half * (memberIds.length - 1) : half; });
+    } else if (p[k.memberId]) p[k.memberId].transfers += cents;
+  }
+  for (const id of memberIds) p[id].spending = spendingByPerson[id] || 0;
+  const total = blank();
+  for (const id of memberIds) for (const key of Object.keys(total)) total[key] += p[id][key];
+  for (const t of [...Object.values(p), total]) {
+    t.leftOver = t.net - t.spending - t.transfers;
+    t.saved = t.k401 + t.match + t.transfers;
+    // Savings rate = everything saved ÷ (gross income + employer match).
+    t.rate = t.gross + t.match > 0 ? t.saved / (t.gross + t.match) : null;
+  }
+  return { person: p, total };
+}
+
+// Latest balance of each account on or before `date`, in USD cents.
+export function balancesAt(accounts, balances, date) {
+  const out = {};
+  for (const a of accounts) {
+    const latest = balances.filter(b => b.accountId === a.id && b.date <= date)
+      .sort((x, y) => x.date.localeCompare(y.date) || x.ts - y.ts).pop();
+    if (latest) out[a.id] = { cents: usdCents(latest.amount, latest.currency, latest.rate), date: latest.date, amount: latest.amount, currency: latest.currency };
+  }
+  return out;
+}
+
+// Net worth at the end of each of the last `n` months ending at `endMonth`.
+export function netWorthSeries(accounts, balances, endMonth, n = 12) {
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const m = addMonths(endMonth, -i);
+    const at = balancesAt(accounts, balances, `${m}-${String(daysInMonth(m)).padStart(2, '0')}`);
+    const vals = Object.values(at);
+    out.push({ month: m, cents: vals.reduce((s, v) => s + v.cents, 0), has: vals.length > 0 });
+  }
+  return out;
+}
