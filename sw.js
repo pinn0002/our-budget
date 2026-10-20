@@ -1,6 +1,6 @@
 // Offline support. Network-first for the app's own files, falling back to cache.
 // Never touches Supabase or exchange-rate requests.
-const CACHE = 'our-budget-v1';
+const CACHE = 'our-budget-v2';
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
   'js/app.js', 'js/crypto.js', 'js/db.js', 'js/model.js', 'js/ocr.js', 'js/store.js', 'js/sync.js',
@@ -30,7 +30,8 @@ self.addEventListener('fetch', e => {
     })));
     return;
   }
-  e.respondWith(fetch(e.request).then(res => {
+  // no-cache: always check GitHub for a newer file instead of trusting the browser's HTTP cache.
+  e.respondWith(fetch(e.request, { cache: 'no-cache' }).then(res => {
     if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }
     return res;
   }).catch(() => caches.match(e.request).then(hit => hit || caches.match('index.html'))));
